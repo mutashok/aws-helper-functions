@@ -1,0 +1,238 @@
+Description: This template deploys a VPC, public subnet,  Internet Gateway and creates a Cloud9 IDE instance in that VPC. A lambda function resizes the volume attached to the cloud9 instance, so do not use the cloud9 instance until this stack is completed.
+
+Parameters:
+  AutomaticStopTime:
+    Type: String
+    Default: "30-Minutes"
+    AllowedValues:
+      - "30-Minutes"
+      - "1-Hour"
+      - "2-Hours"
+      - "4-Hours"
+    Description: Choose a time to auto-hibernate your environment for cost optimization.
+
+  InstanceType:
+    Type: String
+    Default: m5.large
+    AllowedValues:
+      - m5.large
+      - t3.medium
+      - t3.large
+    Description: Cloud9 Instance Type.
+
+  VolumeSize:
+    Type: String
+    Default: 50
+    AllowedValues:
+      - 10
+      - 30
+      - 50
+    Description: Size of the EBS volume attached to the Cloud9 Instance in GiB.
+
+  VpcCIDR:
+    Type: String
+    Default: "10.0.0.0/16"
+    Description: Please enter the IP range (CIDR notation) for this VPC.
+
+Mappings:
+  TimeMap:
+    "1-Hour":
+      Time: 60
+    "2-Hours":
+      Time: 120
+    "30-Minutes":
+      Time: 30
+    "4-Hours":
+      Time: 240
+
+Conditions:
+  RunResize: !Not
+    - "Fn::Equals":
+        - Ref: VolumeSize
+        - 10
+
+Resources:
+  InternetGateway:
+    Type: "AWS::EC2::InternetGateway"
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-IGW"
+
+  VolResizeLambdaPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      ManagedPolicyName: !Sub "${AWS::StackName}-VolResizeLambdaPolicy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - "ec2:DescribeInstances"
+              - "ec2:ModifyVolume"
+              - "ec2:StopInstances"
+              - "logs:CreateLogGroup"
+              - "logs:PutLogEvents"
+              - "logs:CreateLogStream"
+            Resource:
+              - "*"
+
+  VPC:
+    Type: "AWS::EC2::VPC"
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-VPC"
+
+  VolResizeLambdaRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - Ref: VolResizeLambdaPolicy
+      RoleName: !Sub "${AWS::StackName}-VolResizeLambdaRole"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-VolResizeLambdaRole"
+
+  PublicRouteTable:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-RouteTable"
+      VpcId: !Ref VPC
+
+  PublicSubnet:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      AvailabilityZone: !Select
+        - 0
+        - "Fn::GetAZs": ""
+      CidrBlock: !Ref VpcCIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-Subnet"
+      VpcId: !Ref VPC
+
+  InternetGatewayAttachment:
+    Type: "AWS::EC2::VPCGatewayAttachment"
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  DefaultPublicRoute:
+    Type: "AWS::EC2::Route"
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetRouteTableAssociation:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+
+  C9IDE:
+    Type: "AWS::Cloud9::EnvironmentEC2"
+    Properties:
+      AutomaticStopTimeMinutes: !FindInMap
+        - TimeMap
+        - Ref: AutomaticStopTime
+        - Time
+      ConnectionType: CONNECT_SSH
+      Description: !Sub "${AWS::StackName}"
+      InstanceType: !Sub ${InstanceType}
+      Name: !Sub "${AWS::StackName}"
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Purpose
+          Value: !Sub "${AWS::StackName}-Cloud9IDE"
+
+  LambdaResizeVolume:
+    Type: "AWS::Lambda::Function"
+    Condition: RunResize
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          import botocore
+          import json
+          import cfnresponse
+          import time
+          import os
+          
+          def get_disk(client, c9InstanceId):
+              getInstance = client.describe_instances(Filters=[{'Name': 'tag:Name','Values': [c9InstanceId]}])
+              volumeId = getInstance['Reservations'][0]['Instances'][0]['BlockDeviceMappings'][0]['Ebs']['VolumeId']
+              ec2InstanceId = getInstance['Reservations'][0]['Instances'][0]['InstanceId']
+              return (volumeId, ec2InstanceId)
+          
+          def resize_volume(client, volumeId):
+              try:
+                  response = client.modify_volume(VolumeId=volumeId,Size=int(os.environ['DISK_SIZE']))
+              except botocore.exceptions.ClientError as error:
+                  response = {'ResponseMetadata':{'HTTPStatusCode':429,'error':error}}
+              return response
+          
+          def stop_instance(client, ec2InstanceId):
+              response = client.stop_instances(InstanceIds=[ec2InstanceId])
+              return response
+          
+          def lambda_handler(event, context):
+              c9InstanceId = f"aws-cloud9-{os.environ['STACK_NAME']}-{os.environ['C9_IDE']}"
+              if event['RequestType'] == 'Create':
+                  ec2 = boto3.client('ec2')
+                  get_disk_response = get_disk(ec2, c9InstanceId)
+                  volumeId, ec2InstanceId = get_disk_response
+                  volumeResize = resize_volume(ec2, volumeId)
+                  if volumeResize['ResponseMetadata']['HTTPStatusCode'] == 200:
+                      stopInstance = stop_instance(ec2, ec2InstanceId)
+                  else:
+                      stopInstance = {'stopInstance':'check resize_volume response'}
+                  responseData = {'message':{'get_disk_response':get_disk_response,
+                                  'volumeResize':json.dumps(volumeResize,default=str),'stopInstance':json.dumps(stopInstance,default=str)}}
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+              else:
+                  responseData = {'message':'RequestType was not Create'}
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+          
+      Description: Lambda function
+      Environment:
+        Variables:
+          C9_IDE: !Ref C9IDE
+          DISK_SIZE: !Ref VolumeSize
+          STACK_NAME: !Sub "${AWS::StackName}"
+      FunctionName: !Sub "${AWS::StackName}-invoked-by-cfn-c9vol-resize"
+      Handler: index.lambda_handler
+      Role: !GetAtt VolResizeLambdaRole.Arn
+      Runtime: python3.8
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-VolResizeLambdaFunction"
+      Timeout: 90
+
+  InvokeLambdaResizeVolume:
+    Type: "Custom::LambdaResizeVolume"
+    Condition: RunResize
+    DependsOn:
+      - C9IDE
+    Properties:
+      ServiceToken: !GetAtt LambdaResizeVolume.Arn
+
+Outputs:
+  Cloud9Ide:
+    Description: Cloud9 Instance
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloud9/ide/${C9IDE}"
